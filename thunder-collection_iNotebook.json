@@ -1,0 +1,36 @@
+{
+    "clientName": "Thunder Client",
+    "collectionName": "iNotebook",
+    "collectionId": "b03f28de-5af1-4b22-ad1f-998973d67b47",
+    "dateExported": "2024-07-16T06:16:05.540Z",
+    "version": "1.2",
+    "folders": [
+        {
+            "_id": "318cad99-9151-458d-8533-33a80b855e4a",
+            "name": "authentication",
+            "containerId": "",
+            "created": "2024-07-16T05:42:18.014Z",
+            "sortNum": 10000
+        }
+    ],
+    "requests": [
+        {
+            "_id": "4ea86f68-f451-4263-aee2-2d9c8f883627",
+            "colId": "b03f28de-5af1-4b22-ad1f-998973d67b47",
+            "containerId": "318cad99-9151-458d-8533-33a80b855e4a",
+            "name": "Create A New User",
+            "url": "http://localhost:5000/api/auth",
+            "method": "POST",
+            "sortNum": 10000,
+            "created": "2024-07-16T05:42:33.921Z",
+            "modified": "2024-07-16T06:15:46.667Z",
+            "headers": [],
+            "body": {
+                "type": "json",
+                "raw": "{\n  \"name\":\"tanish\",\n  \"email\":\"jainlcukw267@gmail.com\",\n  \"password\":\"wqbdkjbdj\"\n}",
+                "form": []
+            }
+        }
+    ],
+    "ref": "TAmK6uHN74ZZgFW6Ead5IOzyqEvt_6nx0Pw1Z1KfLtrVCDcXRErewnbVxyDWWF75iymkpMIueTV18auhoNLqIA"
+}
