@@ -6,7 +6,12 @@ const app = express();
 const port = process.env.port || 5000;
 
 // Middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: 'https://inotebook-react-new.netlify.app', // Replace with your actual Netlify URL
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  })
+);
 app.use(express.json());
 
 // Available Routes
