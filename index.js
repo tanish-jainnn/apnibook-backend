@@ -1,0 +1,754 @@
+const express = require('express');
+const cors = require('cors');
+const mongoose = require("mongoose");
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+require("dotenv").config();
+const { nanoid } = require('nanoid');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { body, validationResult } = require('express-validator');
+const http = require('http');
+const socketIo = require('socket.io');
+const nodemailer = require('nodemailer');
+const { OAuth2Client } = require('google-auth-library'); // Added for Google auth
+
+// Configuration Constants
+const JWT_SECRET = process.env.JWT_SECRET || 'Tanishisagoodb$oy'; // Use env variable in production
+const port = process.env.PORT || 5000;
+const mongoURI = process.env.MONGO_URI;
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID); // Google OAuth client
+
+// ------------------------------
+// Connect to MongoDB
+// ------------------------------
+const connectToMongo = async () => {
+  try {
+    await mongoose.connect(mongoURI);
+    console.log("Successfully Connected to MongoDB Atlas");
+  } catch (error) {
+    console.error("Error connecting to MongoDB:", error);
+  }
+};
+connectToMongo();
+
+// ------------------------------
+// SCHEMAS & MODELS
+// ------------------------------
+const { Schema } = mongoose;
+
+// User Schema with premium fields and nanoid for uid
+const UserSchema = new Schema({
+  uid: { type: String, default: () => nanoid(), unique: true },
+  name: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  password: { type: String }, // Password is optional for Google users
+  isPremium: { type: Boolean, default: false },
+  premiumUsedFeatures: {
+    ai: { type: Number, default: 0 },
+    voice: { type: Number, default: 0 },
+    export: { type: Number, default: 0 }
+  },
+  date: { type: Date, default: Date.now }
+});
+const User = mongoose.models.User || mongoose.model('User', UserSchema);
+
+// Notes Schema with nanoid, soft delete, public flag, and engagement fields
+const NotesSchema = new Schema({
+  uid: { type: String, default: () => nanoid(), unique: true },
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: { type: String, required: true },
+  description: { type: String, required: true },
+  tag: { type: String, default: "General" },
+  isPublic: { type: Boolean, default: false },
+  isDeleted: { type: Boolean, default: false },
+  likes: { type: Number, default: 0 },
+  comments: [{
+    user: { type: Schema.Types.ObjectId, ref: 'User' },
+    text: String,
+    date: { type: Date, default: Date.now }
+  }],
+  date: { type: Date, default: Date.now }
+});
+const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
+
+// ------------------------------
+// MIDDLEWARE
+// ------------------------------
+
+// JWT Authentication Middleware (for regular users)
+const fetchUser = (req, res, next) => {
+  const token = req.header('auth-token');
+  if (!token) return res.status(401).json({ error: "Please authenticate using a valid token" });
+  try {
+    const data = jwt.verify(token, JWT_SECRET);
+    req.user = data.user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: "Please authenticate using a valid token" });
+  }
+};
+
+// Admin Authentication Middleware
+const adminAuthMiddleware = (req, res, next) => {
+  const token = req.header('auth-token');
+  if (!token) return res.status(401).json({ error: "Access denied: No token provided" });
+  try {
+    const data = jwt.verify(token, JWT_SECRET);
+    if (!data.user || !data.user.admin) {
+      return res.status(403).json({ error: "Access denied: Admins only" });
+    }
+    req.user = data.user;
+    next();
+  } catch (error) {
+    console.error("JWT Verification Error:", error.message);
+    return res.status(401).json({ error: "Invalid token" });
+  }
+};
+
+// Premium Check Middleware (allows limited free usage)
+const checkPremium = async (req, res, next) => {
+  const user = await User.findById(req.user.id);
+  if (!user) return res.status(401).json({ error: "User not found" });
+
+  // Allow up to 2 free usages per feature before upgrade is required.
+  const feature = req.feature; // Set by the route handler
+  if (!user.isPremium && user.premiumUsedFeatures[feature] >= 2) {
+    return res.status(403).json({ message: `Free trial for ${feature} exhausted. Upgrade to premium.` });
+  }
+  next();
+};
+
+// ------------------------------
+// INITIALIZE APP & SECURITY MIDDLEWARE
+// ------------------------------
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, { 
+  cors: { 
+    origin: process.env.NODE_ENV === 'production'
+      ? 'https://inotebook-react-new.netlify.app'
+      : 'http://localhost:3000'
+  }
+});
+
+// Use helmet for basic security
+app.use(helmet());
+
+// Rate Limiting Middleware for sensitive routes
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, 
+  max: 100 
+});
+app.use(limiter);
+
+// Dynamic CORS origin
+const allowedOrigin = process.env.NODE_ENV === 'production'
+  ? 'https://inotebook-react-new.netlify.app'
+  : 'http://localhost:3000';
+app.use(cors({
+  origin: allowedOrigin,
+  methods: ['GET', 'POST', 'PUT', 'DELETE']
+}));
+
+// For parsing JSON bodies
+app.use(express.json());
+
+// ------------------------------
+// SOCKET.IO INTEGRATION
+// ------------------------------
+io.on('connection', (socket) => {
+  console.log("New client connected", socket.id);
+  socket.on('noteUpdated', (data) => {
+    io.emit('noteUpdated', data);
+  });
+  socket.on('disconnect', () => {
+    console.log("Client disconnected", socket.id);
+  });
+});
+
+// ------------------------------
+// ROUTES
+// ------------------------------
+
+// ---------- AUTHENTICATION ROUTES ----------
+const authRouter = express.Router();
+
+// Create User Route
+authRouter.post('/createuser', [
+  body('name', 'Enter a valid name').isLength({ min: 3 }),
+  body('email', 'Enter a valid email').isEmail(),
+  body('password', 'Password must be at least 5 characters').isLength({ min: 5 }),
+], async (req, res) => {
+  let success = false;
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ success, errors: errors.array() });
+  try {
+    let user = await User.findOne({ email: req.body.email });
+    if (user) return res.status(400).json({ success, error: "User with this email already exists" });
+    const salt = await bcrypt.genSalt(10);
+    const secPass = await bcrypt.hash(req.body.password, salt);
+    user = new User({
+      name: req.body.name,
+      email: req.body.email,
+      password: secPass
+    });
+    await user.save();
+
+    const data = { user: { id: user.id } };
+    const authtoken = jwt.sign(data, JWT_SECRET);
+    success = true;
+    // Return nanoId (using the user's uid) along with the token
+    res.json({ success, authtoken, nanoId: user.uid });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Internal Server Error", message: err.message });
+  }
+});
+
+// Login Route
+authRouter.post('/login', [
+  body('email', 'Enter a valid email').isEmail(),
+  body('password', 'Password cannot be blank').exists(),
+], async (req, res) => {
+  let success = false;
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+  
+  const { email, password } = req.body;
+  
+  try {
+    // Check if login is for admin
+    if (email === process.env.ADMIN_EMAIL) {
+      if (password !== process.env.ADMIN_PASSWORD)
+        return res.status(400).json({ success, error: "Invalid admin credentials" });
+      
+      const adminData = { user: { id: "admin", admin: true } };
+      const authtoken = jwt.sign(adminData, JWT_SECRET);
+      success = true;
+      return res.json({ success, authtoken, admin: true });
+    }
+    
+    // Check for regular user
+    let user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ error: "Invalid credentials" });
+    
+    const passwordCompare = await bcrypt.compare(password, user.password);
+    if (!passwordCompare) return res.status(400).json({ success, error: "Invalid credentials" });
+    
+    // Prepare payload with user's id and mark admin as false
+    const data = { user: { id: user.id, admin: false, isPremium: user.isPremium } };    
+    const authtoken = jwt.sign(data, JWT_SECRET);
+
+    success = true;
+    
+    // Send back nanoId (from user.uid) along with the token.
+    res.json({
+      success,
+      authtoken,
+      admin: false,
+      nanoId: user.uid,
+      isPremium: user.isPremium
+    });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Google Authentication Route
+authRouter.post('/google', async (req, res) => {
+  const { idToken } = req.body;
+
+  if (!idToken) {
+    return res.status(400).json({ error: "ID token is required" });
+  }
+
+  try {
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const { email, name } = payload;
+
+    let user = await User.findOne({ email });
+
+    if (user) {
+      const data = { user: { id: user.id, admin: false, isPremium: user.isPremium } };
+      const authtoken = jwt.sign(data, JWT_SECRET);
+      return res.json({
+        success: true,
+        authtoken,
+        nanoId: user.uid,
+        isPremium: user.isPremium
+      });
+    } else {
+      user = new User({
+        name,
+        email
+      });
+      await user.save();
+
+      const data = { user: { id: user.id, admin: false, isPremium: user.isPremium } };
+      const authtoken = jwt.sign(data, JWT_SECRET);
+      return res.json({
+        success: true,
+        authtoken,
+        nanoId: user.uid,
+        isPremium: user.isPremium
+      });
+    }
+  } catch (error) {
+    console.error("Google auth error:", error);
+    return res.status(401).json({ error: "Invalid Google token" });
+  }
+});
+
+// Get User Route
+authRouter.post('/getuser', fetchUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select("-password");
+    res.json(user);
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Upgrade to Premium Route
+authRouter.post('/upgrade', fetchUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    // Update premium status
+    user.isPremium = true;
+    // Optionally adjust or reset premiumUsedFeatures if needed
+    await user.save();
+    res.json({ message: "User upgraded to premium", user });
+  } catch (error) {
+    console.error("Upgrade error:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// ---------- NOTES ROUTES ----------
+const notesRouter = express.Router();
+
+notesRouter.get('/fetchallnotes', fetchUser, async (req, res) => {
+  try {
+    const notes = await Note.find({ user: req.user.id, isDeleted: false });
+    res.json(notes);
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+notesRouter.post('/addnote', fetchUser, [
+  body('title', 'Enter a valid title').isLength({ min: 3 }),
+  body('description', 'Description must be at least 5 characters').isLength({ min: 5 }),
+], async (req, res) => {
+  const { title, description, tag, isPublic } = req.body;
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+  try {
+    const note = new Note({
+      title,
+      description,
+      tag,
+      isPublic: isPublic || false,
+      user: req.user.id
+    });
+    const savedNote = await note.save();
+    io.emit('noteAdded', savedNote);
+    res.json(savedNote);
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+notesRouter.put('/updatenote/:uid', fetchUser, async (req, res) => {
+  const { title, description, tag, isPublic } = req.body;
+  const newNote = {};
+  if (title) newNote.title = title;
+  if (description) newNote.description = description;
+  if (tag) newNote.tag = tag;
+  if (typeof isPublic !== 'undefined') newNote.isPublic = isPublic;
+  try {
+    let note = await Note.findOne({ uid: req.params.uid });
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    if (note.user.toString() !== req.user.id)
+      return res.status(401).json({ error: "Not allowed" });
+    note = await Note.findOneAndUpdate({ uid: req.params.uid }, { $set: newNote }, { new: true });
+    io.emit('noteUpdated', note);
+    res.json({ note });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+notesRouter.delete('/deletenote/:uid', fetchUser, async (req, res) => {
+  try {
+    const note = await Note.findOne({ uid: req.params.uid });
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    if (note.user.toString() !== req.user.id)
+      return res.status(401).json({ error: "Not allowed" });
+    note.isDeleted = true;
+    await note.save();
+    io.emit('noteDeleted', note);
+    res.json({ success: "Note has been soft deleted", note });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+notesRouter.post('/restore/:uid', fetchUser, async (req, res) => {
+  try {
+    const note = await Note.findOne({ uid: req.params.uid });
+    if (!note) return res.status(404).json({ error: "Note not found" });
+    if (note.user.toString() !== req.user.id)
+      return res.status(401).json({ error: "Not allowed" });
+    note.isDeleted = false;
+    await note.save();
+    io.emit('noteRestored', note);
+    res.json({ success: "Note restored", note });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+notesRouter.get('/export/:format/:uid', fetchUser, async (req, res) => {
+  const { format, uid } = req.params;
+  // Implement export logic here (e.g., using pdfkit, json2csv, etc.)
+  res.json({ message: `Exporting note ${uid} as ${format}. (Not yet implemented)` });
+});
+
+notesRouter.post('/:uid/like', fetchUser, async (req, res) => {
+  try {
+    const note = await Note.findOne({ uid: req.params.uid, isPublic: true });
+    if (!note) return res.status(404).json({ error: "Public note not found" });
+    note.likes += 1;
+    await note.save();
+    io.emit('noteLiked', { uid: note.uid, likes: note.likes });
+    res.json({ success: "Note liked", note });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+notesRouter.post('/:uid/comment', fetchUser, async (req, res) => {
+  try {
+    const { text } = req.body;
+    const note = await Note.findOne({ uid: req.params.uid, isPublic: true });
+    if (!note) return res.status(404).json({ error: "Public note not found" });
+    note.comments.push({ user: req.user.id, text });
+    await note.save();
+    io.emit('noteCommented', { uid: note.uid, comment: text });
+    res.json({ success: "Comment added", note });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// ---------- AI & VOICE INPUT ROUTES (Premium-Limited) ----------
+const aiRouter = express.Router();
+const setFeature = (featureName) => (req, res, next) => {
+  req.feature = featureName;
+  next();
+};
+
+aiRouter.post('/generate', fetchUser, setFeature('ai'), checkPremium, async (req, res) => {
+  // Integrate AI logic here
+  res.json({ message: "AI-generated content (Not yet implemented)" });
+});
+
+aiRouter.post('/voice/transcribe', fetchUser, setFeature('voice'), checkPremium, async (req, res) => {
+  // Integrate voice transcription logic here
+  res.json({ message: "Voice transcription result (Not yet implemented)" });
+});
+
+// ---------- RAZORPAY PAYMENT ROUTES ----------
+const paymentRouter = express.Router();
+
+paymentRouter.post('/create', fetchUser, async (req, res) => {
+  // Integrate Razorpay order creation logic here
+  res.json({ message: "Razorpay order created (Not yet implemented)" });
+});
+
+paymentRouter.post('/verify', fetchUser, async (req, res) => {
+  // Integrate payment verification logic here.
+  // Optionally, after successful verification, you can update the user's premium status here.
+  res.json({ message: "Payment verified and user upgraded to premium (Not yet implemented)" });
+});
+
+paymentRouter.get('/invoice/:paymentId', fetchUser, async (req, res) => {
+  // Generate PDF invoice logic here
+  res.json({ message: "Invoice generated (Not yet implemented)" });
+});
+
+// ---------- ANALYTICS & LOGGING ROUTES ----------
+const analyticsRouter = express.Router();
+
+analyticsRouter.get('/user-activity', fetchUser, async (req, res) => {
+  // Compute analytics based on stored data if available
+  res.json({ message: "User activity analytics (Not yet implemented)" });
+});
+
+// ---------- BACKUP & RESTORE ROUTES ----------
+const backupRouter = express.Router();
+
+backupRouter.get('/export/all-notes', fetchUser, async (req, res) => {
+  // Package all notes as a ZIP archive, etc.
+  res.json({ message: "All notes exported as ZIP (Not yet implemented)" });
+});
+
+// ---------- ADMIN ROUTES ----------
+const adminRouter = express.Router();
+
+// Admin dashboard greeting
+adminRouter.get('/dashboard', adminAuthMiddleware, (req, res) => {
+  res.json({ message: "Welcome to the Admin Dashboard!" });
+});
+
+// Real admin endpoints
+adminRouter.get('/overview', adminAuthMiddleware, async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments({});
+    const totalNotes = await Note.countDocuments({});
+    const premiumUsers = await User.countDocuments({ isPremium: true });
+    const freeUsers = totalUsers - premiumUsers;
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const dailySignups = await User.countDocuments({ date: { $gte: oneDayAgo } });
+    const dailyNotes = await Note.countDocuments({ date: { $gte: oneDayAgo } });
+    res.json({ totalUsers, totalNotes, premiumUsers, freeUsers, dailySignups, dailyNotes });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+adminRouter.get('/users', adminAuthMiddleware, async (req, res) => {
+  try {
+    const users = await User.find({}).select("-password");
+    res.json(users);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+adminRouter.get('/notes', adminAuthMiddleware, async (req, res) => {
+  try {
+    const notes = await Note.find({});
+    res.json(notes);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+adminRouter.get('/moderation', adminAuthMiddleware, async (req, res) => {
+  res.json([]);
+});
+
+adminRouter.get('/logs', adminAuthMiddleware, async (req, res) => {
+  res.json([]);
+});
+
+adminRouter.get('/reports', adminAuthMiddleware, async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments({});
+    const totalNotes = await Note.countDocuments({});
+    res.json({
+      userExport: `Total Users: ${totalUsers}`,
+      noteExport: `Total Notes: ${totalNotes}`,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+adminRouter.get('/premium', adminAuthMiddleware, async (req, res) => {
+  try {
+    const totalPremium = await User.countDocuments({ isPremium: true });
+    const trialLimits = {
+      ai: Number(process.env.TRIAL_LIMIT_AI) || 2,
+      voice: Number(process.env.TRIAL_LIMIT_VOICE) || 2,
+      export: Number(process.env.TRIAL_LIMIT_EXPORT) || 2,
+    };
+    res.json({ totalPremium, freeUsageRemaining: trialLimits });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+adminRouter.get('/notifications', adminAuthMiddleware, async (req, res) => {
+  res.json([]);
+});
+
+adminRouter.get('/system', adminAuthMiddleware, async (req, res) => {
+  res.json({
+    enableAI: process.env.ENABLE_AI === 'true',
+    maxNoteSize: process.env.MAX_NOTE_SIZE || "5MB",
+    allowedTags: process.env.ALLOWED_TAGS ? process.env.ALLOWED_TAGS.split(",") : ["General", "Work", "Personal"],
+    trialLimits: {
+      ai: Number(process.env.TRIAL_LIMIT_AI) || 2,
+      voice: Number(process.env.TRIAL_LIMIT_VOICE) || 2,
+      export: Number(process.env.TRIAL_LIMIT_EXPORT) || 2,
+    },
+    language: process.env.LANGUAGE || "en",
+    timezone: process.env.TIMEZONE || "UTC"
+  });
+});
+
+adminRouter.get('/payment', adminAuthMiddleware, async (req, res) => {
+  res.json({
+    lastPaymentDate: null,
+    subscriptionStatus: "Not implemented",
+    transactionHistory: []
+  });
+});
+
+adminRouter.get('/security', adminAuthMiddleware, async (req, res) => {
+  res.json([
+    { role: "Admin", permissions: ["read", "write", "delete"] },
+    { role: "User", permissions: ["read", "create", "update"] }
+  ]);
+});
+
+// ---------- CONTACT ROUTE ----------
+// Contact form route with email sending
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+app.post(
+  "/send-email",
+  [
+    body("name", "Name is required").notEmpty(),
+    body("email", "Enter a valid email").isEmail(),
+    body("message", "Message is required").notEmpty(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { name, email, message } = req.body;
+
+    // Check if SUPPORT_EMAIL is defined
+    if (!process.env.SUPPORT_EMAIL) {
+      console.error("SUPPORT_EMAIL is not defined in environment variables.");
+      return res.status(500).json({ message: "Server configuration error: SUPPORT_EMAIL not set" });
+    }
+
+    try {
+      // Support email options
+      const supportMailOptions = {
+        from: process.env.EMAIL_USER,
+        to: process.env.SUPPORT_EMAIL,
+        subject: `Contact Form Submission from ${name}`,
+        text: `Name: ${name}\nEmail: ${email}\nMessage: ${message}`,
+        replyTo: email,
+      };
+
+      // Send email to support
+      await transporter.sendMail(supportMailOptions);
+
+      // Confirmation email options
+      const websiteLink = "https://www.apninotebook.com";
+      const logoUrl = "https://www.apninotebook.com/logo.png";
+      
+      // Plain text version
+      const textMessage = `Dear ${name},
+      
+      Thank you for contacting ApniNoteBook. We have received your message and appreciate you reaching out to us. A member of our team will review your inquiry and get back to you as soon as possible.
+      
+      If you have any urgent questions, feel free to reply to this email or visit our website at ${websiteLink}.
+      
+      Best regards,
+      The ApniNoteBook Team`;
+      
+      // HTML version
+      const htmlTemplate = `
+      <html>
+      <head>
+      <style>
+      body { font-family: Arial, sans-serif; color: #333; }
+      .header { background-color: #f2f2f2; padding: 20px; text-align: center; }
+      .content { padding: 20px; }
+      .footer { background-color: #f2f2f2; padding: 10px; text-align: center; font-size: 12px; }
+      </style>
+      </head>
+      <body>
+      <div class="header">
+      <img src="${logoUrl}" alt="ApniNoteBook Logo" style="max-width: 150px;">
+      </div>
+      <div class="content">
+      <p>Dear ${name},</p>
+      <p>Thank you for contacting ApniNoteBook. We have received your message and appreciate you reaching out to us.</p>
+      <p>A member of our team will review your inquiry and get back to you as soon as possible.</p>
+      <p>If you have any urgent questions, feel free to reply to this email or visit our website at <a href="${websiteLink}">${websiteLink}</a>.</p>
+      <p>Best regards,<br>The ApniNoteBook Team</p>
+      </div>
+      <div class="footer">
+      <p>© 2023 ApniNoteBook. All rights reserved.</p>
+      </div>
+      </body>
+      </html>
+      `;
+      
+      const confirmationMailOptions = {
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: "We've received your message",
+        text: textMessage,
+        html: htmlTemplate,
+      };
+
+      // Send confirmation email to user
+      try {
+        await transporter.sendMail(confirmationMailOptions);
+      } catch (confirmationError) {
+        console.error("Error sending confirmation email:", confirmationError);
+      }
+
+      // Return success response
+      res.status(200).json({ message: "Email sent successfully" });
+    } catch (supportError) {
+      console.error("Error sending support email:", supportError);
+      res.status(500).json({ message: "Failed to send email" });
+    }
+  }
+);
+
+// ------------------------------
+// MOUNT ROUTES
+// ------------------------------
+app.use('/api/auth', authRouter);
+app.use('/api/notes', notesRouter);
+app.use('/api/ai', aiRouter);
+app.use('/api/payment', paymentRouter);
+app.use('/api/analytics', analyticsRouter);
+app.use('/api/backup', backupRouter);
+app.use('/api/admin', adminRouter); // Protected admin routes
+
+// ------------------------------
+// START SERVER WITH SOCKET.IO
+// ------------------------------
+server.listen(port, () => {
+  console.log(`ApniNoteBook Backend listening on port ${port}`);
+});
