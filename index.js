@@ -11,17 +11,23 @@ const { body, validationResult } = require('express-validator');
 const http = require('http');
 const socketIo = require('socket.io');
 const nodemailer = require('nodemailer');
-const { OAuth2Client } = require('google-auth-library'); // Added for Google auth
+const { OAuth2Client } = require('google-auth-library');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
 
 // Configuration Constants
-const JWT_SECRET = process.env.JWT_SECRET || 'Tanishisagoodb$oy'; // Use env variable in production
+const JWT_SECRET = process.env.JWT_SECRET || 'Tanishisagoodb$oy';
 const port = process.env.PORT || 5000;
 const mongoURI = process.env.MONGO_URI;
-const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID); // Google OAuth client
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// ------------------------------
+// Initialize Razorpay client
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
 // Connect to MongoDB
-// ------------------------------
 const connectToMongo = async () => {
   try {
     await mongoose.connect(mongoURI);
@@ -32,17 +38,14 @@ const connectToMongo = async () => {
 };
 connectToMongo();
 
-// ------------------------------
 // SCHEMAS & MODELS
-// ------------------------------
 const { Schema } = mongoose;
 
-// User Schema with premium fields and nanoid for uid
 const UserSchema = new Schema({
   uid: { type: String, default: () => nanoid(), unique: true },
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
-  password: { type: String }, // Password is optional for Google users
+  password: { type: String },
   isPremium: { type: Boolean, default: false },
   premiumUsedFeatures: {
     ai: { type: Number, default: 0 },
@@ -53,7 +56,6 @@ const UserSchema = new Schema({
 });
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
-// Notes Schema with nanoid, soft delete, public flag, and engagement fields
 const NotesSchema = new Schema({
   uid: { type: String, default: () => nanoid(), unique: true },
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -72,11 +74,7 @@ const NotesSchema = new Schema({
 });
 const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
 
-// ------------------------------
 // MIDDLEWARE
-// ------------------------------
-
-// JWT Authentication Middleware (for regular users)
 const fetchUser = (req, res, next) => {
   const token = req.header('auth-token');
   if (!token) return res.status(401).json({ error: "Please authenticate using a valid token" });
@@ -89,7 +87,6 @@ const fetchUser = (req, res, next) => {
   }
 };
 
-// Admin Authentication Middleware
 const adminAuthMiddleware = (req, res, next) => {
   const token = req.header('auth-token');
   if (!token) return res.status(401).json({ error: "Access denied: No token provided" });
@@ -106,57 +103,46 @@ const adminAuthMiddleware = (req, res, next) => {
   }
 };
 
-// Premium Check Middleware (allows limited free usage)
 const checkPremium = async (req, res, next) => {
   const user = await User.findById(req.user.id);
   if (!user) return res.status(401).json({ error: "User not found" });
 
-  // Allow up to 2 free usages per feature before upgrade is required.
-  const feature = req.feature; // Set by the route handler
+  const feature = req.feature;
   if (!user.isPremium && user.premiumUsedFeatures[feature] >= 2) {
     return res.status(403).json({ message: `Free trial for ${feature} exhausted. Upgrade to premium.` });
   }
   next();
 };
 
-// ------------------------------
 // INITIALIZE APP & SECURITY MIDDLEWARE
-// ------------------------------
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, { 
   cors: { 
     origin: process.env.NODE_ENV === 'production'
-      ? 'https://inotebook-react-new.netlify.app'
-      : 'http://localhost:3000'
+    ? ['https://inotebook-react-new.netlify.app', 'https://apninotebook.in']
+    : ['http://localhost:3000']
   }
 });
 
-// Use helmet for basic security
 app.use(helmet());
-
-// Rate Limiting Middleware for sensitive routes
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 100 
 });
 app.use(limiter);
 
-// Dynamic CORS origin
 const allowedOrigin = process.env.NODE_ENV === 'production'
-  ? 'https://inotebook-react-new.netlify.app'
-  : 'http://localhost:3000';
+  ? ['https://inotebook-react-new.netlify.app', 'https://apninotebook.in']
+  : ['http://localhost:3000'];
 app.use(cors({
   origin: allowedOrigin,
   methods: ['GET', 'POST', 'PUT', 'DELETE']
 }));
 
-// For parsing JSON bodies
 app.use(express.json());
 
-// ------------------------------
 // SOCKET.IO INTEGRATION
-// ------------------------------
 io.on('connection', (socket) => {
   console.log("New client connected", socket.id);
   socket.on('noteUpdated', (data) => {
@@ -167,14 +153,11 @@ io.on('connection', (socket) => {
   });
 });
 
-// ------------------------------
 // ROUTES
-// ------------------------------
 
-// ---------- AUTHENTICATION ROUTES ----------
+// AUTHENTICATION ROUTES
 const authRouter = express.Router();
 
-// Create User Route
 authRouter.post('/createuser', [
   body('name', 'Enter a valid name').isLength({ min: 3 }),
   body('email', 'Enter a valid email').isEmail(),
@@ -198,7 +181,6 @@ authRouter.post('/createuser', [
     const data = { user: { id: user.id } };
     const authtoken = jwt.sign(data, JWT_SECRET);
     success = true;
-    // Return nanoId (using the user's uid) along with the token
     res.json({ success, authtoken, nanoId: user.uid });
   } catch (err) {
     console.error(err.message);
@@ -206,7 +188,6 @@ authRouter.post('/createuser', [
   }
 });
 
-// Login Route
 authRouter.post('/login', [
   body('email', 'Enter a valid email').isEmail(),
   body('password', 'Password cannot be blank').exists(),
@@ -218,7 +199,6 @@ authRouter.post('/login', [
   const { email, password } = req.body;
   
   try {
-    // Check if login is for admin
     if (email === process.env.ADMIN_EMAIL) {
       if (password !== process.env.ADMIN_PASSWORD)
         return res.status(400).json({ success, error: "Invalid admin credentials" });
@@ -229,20 +209,17 @@ authRouter.post('/login', [
       return res.json({ success, authtoken, admin: true });
     }
     
-    // Check for regular user
     let user = await User.findOne({ email });
     if (!user) return res.status(400).json({ error: "Invalid credentials" });
     
     const passwordCompare = await bcrypt.compare(password, user.password);
     if (!passwordCompare) return res.status(400).json({ success, error: "Invalid credentials" });
     
-    // Prepare payload with user's id and mark admin as false
     const data = { user: { id: user.id, admin: false, isPremium: user.isPremium } };    
     const authtoken = jwt.sign(data, JWT_SECRET);
 
     success = true;
     
-    // Send back nanoId (from user.uid) along with the token.
     res.json({
       success,
       authtoken,
@@ -256,7 +233,6 @@ authRouter.post('/login', [
   }
 });
 
-// Google Authentication Route
 authRouter.post('/google', async (req, res) => {
   const { idToken } = req.body;
 
@@ -305,7 +281,6 @@ authRouter.post('/google', async (req, res) => {
   }
 });
 
-// Get User Route
 authRouter.post('/getuser', fetchUser, async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select("-password");
@@ -316,14 +291,11 @@ authRouter.post('/getuser', fetchUser, async (req, res) => {
   }
 });
 
-// Upgrade to Premium Route
 authRouter.post('/upgrade', fetchUser, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ error: "User not found" });
-    // Update premium status
     user.isPremium = true;
-    // Optionally adjust or reset premiumUsedFeatures if needed
     await user.save();
     res.json({ message: "User upgraded to premium", user });
   } catch (error) {
@@ -332,7 +304,7 @@ authRouter.post('/upgrade', fetchUser, async (req, res) => {
   }
 });
 
-// ---------- NOTES ROUTES ----------
+// NOTES ROUTES
 const notesRouter = express.Router();
 
 notesRouter.get('/fetchallnotes', fetchUser, async (req, res) => {
@@ -424,7 +396,6 @@ notesRouter.post('/restore/:uid', fetchUser, async (req, res) => {
 
 notesRouter.get('/export/:format/:uid', fetchUser, async (req, res) => {
   const { format, uid } = req.params;
-  // Implement export logic here (e.g., using pdfkit, json2csv, etc.)
   res.json({ message: `Exporting note ${uid} as ${format}. (Not yet implemented)` });
 });
 
@@ -457,7 +428,7 @@ notesRouter.post('/:uid/comment', fetchUser, async (req, res) => {
   }
 });
 
-// ---------- AI & VOICE INPUT ROUTES (Premium-Limited) ----------
+// AI & VOICE INPUT ROUTES
 const aiRouter = express.Router();
 const setFeature = (featureName) => (req, res, next) => {
   req.feature = featureName;
@@ -465,59 +436,93 @@ const setFeature = (featureName) => (req, res, next) => {
 };
 
 aiRouter.post('/generate', fetchUser, setFeature('ai'), checkPremium, async (req, res) => {
-  // Integrate AI logic here
   res.json({ message: "AI-generated content (Not yet implemented)" });
 });
 
 aiRouter.post('/voice/transcribe', fetchUser, setFeature('voice'), checkPremium, async (req, res) => {
-  // Integrate voice transcription logic here
   res.json({ message: "Voice transcription result (Not yet implemented)" });
 });
 
-// ---------- RAZORPAY PAYMENT ROUTES ----------
+// RAZORPAY PAYMENT ROUTES
 const paymentRouter = express.Router();
 
-paymentRouter.post('/create', fetchUser, async (req, res) => {
-  // Integrate Razorpay order creation logic here
-  res.json({ message: "Razorpay order created (Not yet implemented)" });
-});
 
+
+paymentRouter.post('/create-order', fetchUser, async (req, res) => {
+  try {
+    const options = {
+      amount: 99900, // ₹999 in paise
+      currency: "INR",
+      receipt: `receipt_${Date.now()}`,
+      payment_capture: 1,
+    };
+    const order = await razorpay.orders.create(options);
+    res.json({
+      orderId: order.id,
+      razorpayKey: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (error) {
+    console.error("Error creating Razorpay order:", error);
+    res.status(500).json({ error: "Failed to create order" });
+  }
+});
 paymentRouter.post('/verify', fetchUser, async (req, res) => {
-  // Integrate payment verification logic here.
-  // Optionally, after successful verification, you can update the user's premium status here.
-  res.json({ message: "Payment verified and user upgraded to premium (Not yet implemented)" });
+  const { paymentId, orderId, signature } = req.body;
+  
+  if (!paymentId || !orderId || !signature) {
+    return res.status(400).json({ error: "Missing payment details" });
+  }
+  
+  try {
+    const generatedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(`${orderId}|${paymentId}`)
+      .digest('hex');
+    
+    if (generatedSignature === signature) {
+      const user = await User.findById(req.user.id);
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      if (user.isPremium) {
+        return res.json({ success: true, message: "User is already premium" });
+      }
+      user.isPremium = true;
+      await user.save();
+      res.json({ success: true, message: "Payment verified and user upgraded to premium" });
+    } else {
+      res.status(400).json({ error: "Invalid signature" });
+    }
+  } catch (error) {
+    console.error("Error verifying payment:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 paymentRouter.get('/invoice/:paymentId', fetchUser, async (req, res) => {
-  // Generate PDF invoice logic here
   res.json({ message: "Invoice generated (Not yet implemented)" });
 });
 
-// ---------- ANALYTICS & LOGGING ROUTES ----------
+// ANALYTICS & LOGGING ROUTES
 const analyticsRouter = express.Router();
 
 analyticsRouter.get('/user-activity', fetchUser, async (req, res) => {
-  // Compute analytics based on stored data if available
   res.json({ message: "User activity analytics (Not yet implemented)" });
 });
 
-// ---------- BACKUP & RESTORE ROUTES ----------
+// BACKUP & RESTORE ROUTES
 const backupRouter = express.Router();
 
 backupRouter.get('/export/all-notes', fetchUser, async (req, res) => {
-  // Package all notes as a ZIP archive, etc.
   res.json({ message: "All notes exported as ZIP (Not yet implemented)" });
 });
 
-// ---------- ADMIN ROUTES ----------
+// ADMIN ROUTES
 const adminRouter = express.Router();
 
-// Admin dashboard greeting
 adminRouter.get('/dashboard', adminAuthMiddleware, (req, res) => {
   res.json({ message: "Welcome to the Admin Dashboard!" });
 });
 
-// Real admin endpoints
 adminRouter.get('/overview', adminAuthMiddleware, async (req, res) => {
   try {
     const totalUsers = await User.countDocuments({});
@@ -625,8 +630,7 @@ adminRouter.get('/security', adminAuthMiddleware, async (req, res) => {
   ]);
 });
 
-// ---------- CONTACT ROUTE ----------
-// Contact form route with email sending
+// CONTACT ROUTE
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -649,14 +653,12 @@ app.post(
 
     const { name, email, message } = req.body;
 
-    // Check if SUPPORT_EMAIL is defined
     if (!process.env.SUPPORT_EMAIL) {
       console.error("SUPPORT_EMAIL is not defined in environment variables.");
       return res.status(500).json({ message: "Server configuration error: SUPPORT_EMAIL not set" });
     }
 
     try {
-      // Support email options
       const supportMailOptions = {
         from: process.env.EMAIL_USER,
         to: process.env.SUPPORT_EMAIL,
@@ -665,14 +667,11 @@ app.post(
         replyTo: email,
       };
 
-      // Send email to support
       await transporter.sendMail(supportMailOptions);
 
-      // Confirmation email options
       const websiteLink = "https://www.apninotebook.com";
       const logoUrl = "https://www.apninotebook.com/logo.png";
       
-      // Plain text version
       const textMessage = `Dear ${name},
       
       Thank you for contacting ApniNoteBook. We have received your message and appreciate you reaching out to us. A member of our team will review your inquiry and get back to you as soon as possible.
@@ -682,7 +681,6 @@ app.post(
       Best regards,
       The ApniNoteBook Team`;
       
-      // HTML version
       const htmlTemplate = `
       <html>
       <head>
@@ -719,14 +717,12 @@ app.post(
         html: htmlTemplate,
       };
 
-      // Send confirmation email to user
       try {
         await transporter.sendMail(confirmationMailOptions);
       } catch (confirmationError) {
         console.error("Error sending confirmation email:", confirmationError);
       }
 
-      // Return success response
       res.status(200).json({ message: "Email sent successfully" });
     } catch (supportError) {
       console.error("Error sending support email:", supportError);
@@ -735,20 +731,16 @@ app.post(
   }
 );
 
-// ------------------------------
 // MOUNT ROUTES
-// ------------------------------
 app.use('/api/auth', authRouter);
 app.use('/api/notes', notesRouter);
 app.use('/api/ai', aiRouter);
 app.use('/api/payment', paymentRouter);
 app.use('/api/analytics', analyticsRouter);
 app.use('/api/backup', backupRouter);
-app.use('/api/admin', adminRouter); // Protected admin routes
+app.use('/api/admin', adminRouter);
 
-// ------------------------------
 // START SERVER WITH SOCKET.IO
-// ------------------------------
 server.listen(port, () => {
   console.log(`ApniNoteBook Backend listening on port ${port}`);
 });
