@@ -74,6 +74,75 @@ const NotesSchema = new Schema({
 });
 const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
 
+// Temporary storage for OTPs
+const otpStore = new Map();
+
+// Nodemailer transporter
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+// Function to generate OTP
+const generateOTP = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit OTP
+};
+
+// Function to send OTP email
+const sendOTPEmail = async (email, otp) => {
+  const websiteLink = "https://www.apninotebook..in";
+  const logoUrl = "https://i.imgur.com/khkAWrT.png";
+  
+  const textMessage = `Dear User,
+  
+  Your OTP for ApniNoteBook is: ${otp}. It expires in 15 minutes.
+  
+  If you did not request this, please ignore this email.
+  
+  Best regards,
+  The ApniNoteBook Team`;
+  
+  const htmlTemplate = `
+  <html>
+  <head>
+  <style>
+  body { font-family: Arial, sans-serif; color: #333; }
+  .header { background-color: #f2f2f2; padding: 20px; text-align: center; }
+  .content { padding: 20px; }
+  .footer { background-color: #f2f2f2; padding: 10px; text-align: center; font-size: 12px; }
+  </style>
+  </head>
+  <body>
+  <div class="header">
+  <img src="${logoUrl}" alt="ApniNoteBook Logo" style="max-width: 150px;">
+  </div>
+  <div class="content">
+  <p>Dear User,</p>
+  <p>Your OTP for ApniNoteBook is: <strong>${otp}</strong>. It expires in 15 minutes.</p>
+  <p>If you did not request this, please ignore this email.</p>
+  <p>Best regards,<br>The ApniNoteBook Team</p>
+  </div>
+  <div class="footer">
+  <p>© 2023 ApniNoteBook. All rights reserved.</p>
+  </div>
+  </body>
+  </html>
+  `;
+  
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: "Your OTP for ApniNoteBook",
+    text: textMessage,
+    html: htmlTemplate,
+  };
+
+  await transporter.sendMail(mailOptions);
+};
+
 // MIDDLEWARE
 const fetchUser = (req, res, next) => {
   const token = req.header('auth-token');
@@ -158,7 +227,7 @@ io.on('connection', (socket) => {
 // AUTHENTICATION ROUTES
 const authRouter = express.Router();
 
-authRouter.post('/createuser', [
+authRouter.post('/signup-with-otp', [
   body('name', 'Enter a valid name').isLength({ min: 3 }),
   body('email', 'Enter a valid email').isEmail(),
   body('password', 'Password must be at least 5 characters').isLength({ min: 5 }),
@@ -169,15 +238,64 @@ authRouter.post('/createuser', [
   try {
     let user = await User.findOne({ email: req.body.email });
     if (user) return res.status(400).json({ success, error: "User with this email already exists" });
-    const salt = await bcrypt.genSalt(10);
-    const secPass = await bcrypt.hash(req.body.password, salt);
-    user = new User({
+    
+    const otp = generateOTP();
+    const otpExpiration = Date.now() + 15 * 60 * 1000; // 15 minutes
+
+    // Store OTP and user data temporarily
+    otpStore.set(req.body.email, {
+      otp,
       name: req.body.name,
       email: req.body.email,
+      password: req.body.password,
+      expiration: otpExpiration,
+    });
+
+    // Send OTP email
+    await sendOTPEmail(req.body.email, otp);
+
+    success = true;
+    res.json({ success, message: "OTP sent to your email." });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).json({ error: "Internal Server Error", message: err.message });
+  }
+});
+
+authRouter.post('/verify-otp', [
+  body('email', 'Enter a valid email').isEmail(),
+  body('otp', 'OTP is required').notEmpty(),
+], async (req, res) => {
+  let success = false;
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ success, errors: errors.array() });
+  
+  const { email, otp } = req.body;
+  
+  try {
+    const storedData = otpStore.get(email);
+    if (!storedData) return res.status(400).json({ success, error: "OTP not found or expired" });
+    
+    if (Date.now() > storedData.expiration) {
+      otpStore.delete(email);
+      return res.status(400).json({ success, error: "OTP expired" });
+    }
+    
+    if (storedData.otp !== otp) return res.status(400).json({ success, error: "Invalid OTP" });
+    
+    // OTP is valid, create the user
+    const salt = await bcrypt.genSalt(10);
+    const secPass = await bcrypt.hash(storedData.password, salt);
+    const user = new User({
+      name: storedData.name,
+      email: storedData.email,
       password: secPass
     });
     await user.save();
-
+    
+    // Delete OTP from store
+    otpStore.delete(email);
+    
     const data = { user: { id: user.id } };
     const authtoken = jwt.sign(data, JWT_SECRET);
     success = true;
@@ -446,8 +564,6 @@ aiRouter.post('/voice/transcribe', fetchUser, setFeature('voice'), checkPremium,
 // RAZORPAY PAYMENT ROUTES
 const paymentRouter = express.Router();
 
-
-
 paymentRouter.post('/create-order', fetchUser, async (req, res) => {
   try {
     const options = {
@@ -631,13 +747,6 @@ adminRouter.get('/security', adminAuthMiddleware, async (req, res) => {
 });
 
 // CONTACT ROUTE
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
 app.post(
   "/send-email",
   [
@@ -669,8 +778,8 @@ app.post(
 
       await transporter.sendMail(supportMailOptions);
 
-      const websiteLink = "https://www.apninotebook.com";
-      const logoUrl = "https://www.apninotebook.com/logo.png";
+      const websiteLink = "https://www.apninotebook.in";
+      const logoUrl = "https://i.imgur.com/khkAWrT.png";
       
       const textMessage = `Dear ${name},
       
