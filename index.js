@@ -76,6 +76,7 @@ const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
 
 // Temporary storage for OTPs
 const otpStore = new Map();
+const resetStore = new Map();  // Add this line
 
 // Nodemailer transporter
 const transporter = nodemailer.createTransport({
@@ -262,47 +263,138 @@ authRouter.post('/signup-with-otp', [
   }
 });
 
-authRouter.post('/verify-otp', [
-  body('email', 'Enter a valid email').isEmail(),
-  body('otp', 'OTP is required').notEmpty(),
-], async (req, res) => {
-  let success = false;
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ success, errors: errors.array() });
+authRouter.post('/verify-otp', async (req, res) => {
+  const { email, otp, resetToken } = req.body;
   
-  const { email, otp } = req.body;
+  if (resetToken) {
+    // Forgot password OTP verification
+    try {
+      const resetData = resetStore.get(resetToken);
+      if (!resetData) return res.status(400).json({ error: "Invalid or expired reset token" });
+      
+      if (Date.now() > resetData.expiration) {
+        resetStore.delete(resetToken);
+        return res.status(400).json({ error: "Reset token expired" });
+      }
+      
+      if (resetData.otp !== otp) return res.status(400).json({ error: "Invalid OTP" });
+      
+      // OTP is valid, mark as verified
+      resetData.isVerified = true;
+      resetStore.set(resetToken, resetData);
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error(error.message);
+      res.status(500).json({ error: "Internal Server Error" });
+    }
+  } else if (email) {
+    // Signup OTP verification (original code)
+    let success = false;
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ success, errors: errors.array() });
+    
+    try {
+      const storedData = otpStore.get(email);
+      if (!storedData) return res.status(400).json({ success, error: "OTP not found or expired" });
+      
+      if (Date.now() > storedData.expiration) {
+        otpStore.delete(email);
+        return res.status(400).json({ success, error: "OTP expired" });
+      }
+      
+      if (storedData.otp !== otp) return res.status(400).json({ success, error: "Invalid OTP" });
+      
+      const salt = await bcrypt.genSalt(10);
+      const secPass = await bcrypt.hash(storedData.password, salt);
+      const user = new User({
+        name: storedData.name,
+        email: storedData.email,
+        password: secPass
+      });
+      await user.save();
+      
+      otpStore.delete(email);
+      
+      const data = { user: { id: user.id } };
+      const authtoken = jwt.sign(data, JWT_SECRET);
+      success = true;
+      res.json({ success, authtoken, nanoId: user.uid });
+    } catch (err) {
+      console.error(err.message);
+      res.status(500).json({ error: "Internal Server Error", message: err.message });
+    }
+  } else {
+    res.status(400).json({ error: "Invalid request: provide either email or resetToken" });
+  }
+});
+
+authRouter.post('/reset-password', [
+  body('newPassword', 'Password must be at least 5 characters').isLength({ min: 5 }),
+  body('resetToken', 'Reset token is required').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+  
+  const { newPassword, resetToken } = req.body;
   
   try {
-    const storedData = otpStore.get(email);
-    if (!storedData) return res.status(400).json({ success, error: "OTP not found or expired" });
+    const resetData = resetStore.get(resetToken);
+    if (!resetData) return res.status(400).json({ error: "Invalid or expired reset token" });
     
-    if (Date.now() > storedData.expiration) {
-      otpStore.delete(email);
-      return res.status(400).json({ success, error: "OTP expired" });
+    if (Date.now() > resetData.expiration) {
+      resetStore.delete(resetToken);
+      return res.status(400).json({ error: "Reset token expired" });
     }
     
-    if (storedData.otp !== otp) return res.status(400).json({ success, error: "Invalid OTP" });
+    if (!resetData.isVerified) return res.status(400).json({ error: "OTP not verified" });
     
-    // OTP is valid, create the user
+    const user = await User.findById(resetData.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    
     const salt = await bcrypt.genSalt(10);
-    const secPass = await bcrypt.hash(storedData.password, salt);
-    const user = new User({
-      name: storedData.name,
-      email: storedData.email,
-      password: secPass
-    });
+    const secPass = await bcrypt.hash(newPassword, salt);
+    user.password = secPass;
     await user.save();
     
-    // Delete OTP from store
-    otpStore.delete(email);
+    resetStore.delete(resetToken);
     
-    const data = { user: { id: user.id } };
-    const authtoken = jwt.sign(data, JWT_SECRET);
-    success = true;
-    res.json({ success, authtoken, nanoId: user.uid });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Internal Server Error", message: err.message });
+    res.json({ success: true, message: "Password reset successfully" });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+authRouter.post('/forgot-password', [
+  body('email', 'Enter a valid email').isEmail(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+  
+  const { email } = req.body;
+  
+  try {
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    
+    const resetToken = nanoid();
+    const otp = generateOTP();
+    const expiration = Date.now() + 15 * 60 * 1000; // 15 minutes
+    
+    resetStore.set(resetToken, {
+      userId: user.id,
+      otp,
+      isVerified: false,
+      expiration,
+    });
+    
+    // Send OTP email using existing function
+    await sendOTPEmail(email, otp);
+    
+    res.json({ success: true, resetToken });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
