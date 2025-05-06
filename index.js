@@ -76,7 +76,7 @@ const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
 
 // Temporary storage for OTPs
 const otpStore = new Map();
-const resetStore = new Map();  // Add this line
+const resetStore = new Map();
 
 // Nodemailer transporter
 const transporter = nodemailer.createTransport({
@@ -94,7 +94,7 @@ const generateOTP = () => {
 
 // Function to send OTP email
 const sendOTPEmail = async (email, otp) => {
-  const websiteLink = "https://www.apninotebook..in";
+  const websiteLink = "https://www.apninotebook.in";
   const logoUrl = "https://i.imgur.com/khkAWrT.png";
   
   const textMessage = `Dear User,
@@ -289,7 +289,7 @@ authRouter.post('/verify-otp', async (req, res) => {
       res.status(500).json({ error: "Internal Server Error" });
     }
   } else if (email) {
-    // Signup OTP verification (original code)
+    // Signup OTP verification
     let success = false;
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ success, errors: errors.array() });
@@ -365,6 +365,7 @@ authRouter.post('/reset-password', [
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
+
 authRouter.post('/forgot-password', [
   body('email', 'Enter a valid email').isEmail(),
 ], async (req, res) => {
@@ -527,6 +528,16 @@ notesRouter.get('/fetchallnotes', fetchUser, async (req, res) => {
   }
 });
 
+notesRouter.get('/public', async (req, res) => {
+  try {
+    const publicNotes = await Note.find({ isPublic: true, isDeleted: false }).populate('user', 'name');
+    res.json(publicNotes);
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
 notesRouter.post('/addnote', fetchUser, [
   body('title', 'Enter a valid title').isLength({ min: 3 }),
   body('description', 'Description must be at least 5 characters').isLength({ min: 5 }),
@@ -674,6 +685,7 @@ paymentRouter.post('/create-order', fetchUser, async (req, res) => {
     res.status(500).json({ error: "Failed to create order" });
   }
 });
+
 paymentRouter.post('/verify', fetchUser, async (req, res) => {
   const { paymentId, orderId, signature } = req.body;
   
