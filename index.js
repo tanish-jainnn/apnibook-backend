@@ -52,7 +52,8 @@ const UserSchema = new Schema({
     voice: { type: Number, default: 0 },
     export: { type: Number, default: 0 }
   },
-  date: { type: Date, default: Date.now }
+  date: { type: Date, default: Date.now },
+  lastNameChange: { type: Date, default: new Date(0) }
 });
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
@@ -128,6 +129,7 @@ const sendOTPEmail = async (email, otp) => {
   </div>
   <div class="footer">
   <p>© 2023 ApniNoteBook. All rights reserved.</p>
+  <p>"${websiteLink}"</p>
   </div>
   </body>
   </html>
@@ -511,6 +513,130 @@ authRouter.post('/upgrade', fetchUser, async (req, res) => {
     res.json({ message: "User upgraded to premium", user });
   } catch (error) {
     console.error("Upgrade error:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+authRouter.post('/change-name', fetchUser, [
+  body('name', 'Name must be at least 3 characters').isLength({ min: 3 }),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const lastNameChange = user.lastNameChange || new Date(0);
+    const daysSinceLastChange = (Date.now() - lastNameChange) / (1000 * 60 * 60 * 24);
+    if (daysSinceLastChange < 14) {
+      return res.status(400).json({ error: "You can only change your name every 14 days" });
+    }
+
+    user.name = req.body.name;
+    user.lastNameChange = Date.now();
+    await user.save();
+
+    res.json({ success: true, message: "Name changed successfully" });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+authRouter.post('/change-email', fetchUser, [
+  body('email', 'Enter a valid email').isEmail(),
+  body('password', 'Password cannot be blank').exists(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const passwordCompare = await bcrypt.compare(req.body.password, user.password);
+    if (!passwordCompare) return res.status(400).json({ error: "Invalid password" });
+
+    const otp = generateOTP();
+    const otpExpiration = Date.now() + 15 * 60 * 1000; // 15 minutes
+    otpStore.set(req.body.email, { otp, expiration: otpExpiration, userId: user.id, newEmail: req.body.email });
+
+    await sendOTPEmail(req.body.email, otp);
+
+    res.json({ success: true, message: "OTP sent to new email for verification" });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+authRouter.post('/verify-email-change', fetchUser, async (req, res) => {
+  const { email, otp } = req.body;
+
+  try {
+    const storedData = otpStore.get(email);
+    if (!storedData) return res.status(400).json({ error: "OTP not found or expired" });
+
+    if (Date.now() > storedData.expiration) {
+      otpStore.delete(email);
+      return res.status(400).json({ error: "OTP expired" });
+    }
+
+    if (storedData.otp !== otp) return res.status(400).json({ error: "Invalid OTP" });
+
+    const user = await User.findById(storedData.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    user.email = storedData.newEmail;
+    await user.save();
+
+    otpStore.delete(email);
+
+    res.json({ success: true, message: "Email changed successfully" });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+authRouter.post('/change-password', fetchUser, [
+  body('currentPassword', 'Current password is required').exists(),
+  body('newPassword', 'New password must be at least 5 characters').isLength({ min: 5 }),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const passwordCompare = await bcrypt.compare(req.body.currentPassword, user.password);
+    if (!passwordCompare) return res.status(400).json({ error: "Invalid current password" });
+
+    const salt = await bcrypt.genSalt(10);
+    const secPass = await bcrypt.hash(req.body.newPassword, salt);
+    user.password = secPass;
+    await user.save();
+
+    res.json({ success: true, message: "Password changed successfully" });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+authRouter.delete('/delete-account', fetchUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    await Note.deleteMany({ user: req.user.id });
+    await User.findByIdAndDelete(req.user.id);
+
+    res.json({ success: true, message: "Account deleted successfully" });
+  } catch (error) {
+    console.error(error.message);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
