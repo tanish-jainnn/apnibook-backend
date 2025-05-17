@@ -79,8 +79,18 @@ const NotesSchema = new Schema({
   ],
   date: { type: Date, default: Date.now },
   likedBy: [{ type: Schema.Types.ObjectId, ref: 'User' }],
+  folder: { type: String, default: '' }, // Added folder field
 });
+
 const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
+
+const FolderSchema = new Schema({
+  uid: { type: String, default: () => nanoid(), unique: true },
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  name: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+const Folder = mongoose.models.Folder || mongoose.model('Folder', FolderSchema);
 
 const LogSchema = new Schema({
   action: { type: String, required: true },
@@ -286,6 +296,61 @@ io.on('connection', (socket) => {
 // ROUTES
 
 // AUTHENTICATION ROUTES
+
+
+
+// FOLDER ROUTES
+const folderRouter = express.Router();
+
+folderRouter.get('/', fetchUser, async (req, res) => {
+  try {
+    const folders = await Folder.find({ user: req.user.id }).select('name');
+    res.json(folders);
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+folderRouter.post(
+  '/',
+  fetchUser,
+  [body('name', 'Folder name must be at least 3 characters').isLength({ min: 3 })],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const { name } = req.body;
+    try {
+      const existingFolder = await Folder.findOne({ name, user: req.user.id });
+      if (existingFolder) {
+        return res.status(400).json({ error: 'Folder with this name already exists' });
+      }
+
+      const folder = new Folder({
+        name,
+        user: req.user.id,
+      });
+      const savedFolder = await folder.save();
+
+      await Log.create({
+        action: 'Folder Created',
+        user: req.user.id,
+        details: `Folder ${savedFolder.uid} created by user ${req.user.id}`,
+      });
+
+      io.emit('folderAdded', savedFolder);
+      res.json(savedFolder);
+    } catch (error) {
+      console.error('Error creating folder:', error);
+      if (error.code === 11000) {
+        return res.status(400).json({ error: 'Folder creation failed due to duplicate key' });
+      }
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+
 const authRouter = express.Router();
 
 authRouter.post(
@@ -900,6 +965,82 @@ notesRouter.delete('/deletenote/:uid', fetchUser, async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
+notesRouter.post(
+  '/bulk-delete',
+  fetchUser,
+  [body('noteIds', 'Note IDs must be an array').isArray({ min: 1 })],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const { noteIds } = req.body;
+    try {
+      const notes = await Note.find({ uid: { $in: noteIds }, user: req.user.id });
+      if (notes.length !== noteIds.length) {
+        return res.status(404).json({ error: 'Some notes not found or not owned by user' });
+      }
+
+      await Note.updateMany(
+        { uid: { $in: noteIds }, user: req.user.id },
+        { $set: { isDeleted: true } }
+      );
+
+      await Log.create({
+        action: 'Notes Bulk Deleted',
+        user: req.user.id,
+        details: `Notes ${noteIds.join(', ')} soft deleted by user ${req.user.id}`,
+      });
+
+      io.emit('notesBulkDeleted', { noteIds });
+      res.json({ success: true, message: 'Notes soft deleted' });
+    } catch (error) {
+      console.error(error.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+
+notesRouter.post(
+  '/bulk-move',
+  fetchUser,
+  [
+    body('noteIds', 'Note IDs must be an array').isArray({ min: 1 }),
+    body('folder', 'Folder name is required').notEmpty(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const { noteIds, folder } = req.body;
+    try {
+      const folderExists = await Folder.findOne({ name: folder, user: req.user.id });
+      if (!folderExists) return res.status(404).json({ error: 'Folder not found' });
+
+      const notes = await Note.find({ uid: { $in: noteIds }, user: req.user.id });
+      if (notes.length !== noteIds.length) {
+        return res.status(404).json({ error: 'Some notes not found or not owned by user' });
+      }
+
+      await Note.updateMany(
+        { uid: { $in: noteIds }, user: req.user.id },
+        { $set: { folder } }
+      );
+
+      await Log.create({
+        action: 'Notes Bulk Moved',
+        user: req.user.id,
+        details: `Notes ${noteIds.join(', ')} moved to folder ${folder} by user ${req.user.id}`,
+      });
+
+      io.emit('notesBulkMoved', { noteIds, folder });
+      res.json({ success: true, message: 'Notes moved to folder' });
+    } catch (error) {
+      console.error(error.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
 
 notesRouter.delete('/:noteUid/comment/:commentId', fetchUser, async (req, res) => {
   try {
@@ -1690,6 +1831,7 @@ app.use('/api/payment', paymentRouter);
 app.use('/api/analytics', analyticsRouter);
 app.use('/api/backup', backupRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/folders', folderRouter);
 
 // START SERVER WITH SOCKET.IO
 server.listen(port, () => {
