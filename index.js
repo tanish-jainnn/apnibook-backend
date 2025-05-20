@@ -56,8 +56,18 @@ const UserSchema = new Schema({
   },
   date: { type: Date, default: Date.now },
   lastNameChange: { type: Date, default: new Date(0) },
-});
+  profilePicture: { type: String, default: null }, // Added for base64 image
+}); 
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
+
+const FolderSchema = new Schema({
+  id: { type: String, default: () => nanoid(), unique: true }, // Changed from uid to id
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  name: { type: String, required: true },
+  parentFolder: { type: String, default: null }, // Reference to parent folder's id (null for root)
+  createdAt: { type: Date, default: Date.now },
+});
+const Folder = mongoose.models.Folder || mongoose.model('Folder', FolderSchema);
 
 const NotesSchema = new Schema({
   uid: { type: String, default: () => nanoid(), unique: true },
@@ -79,18 +89,9 @@ const NotesSchema = new Schema({
   ],
   date: { type: Date, default: Date.now },
   likedBy: [{ type: Schema.Types.ObjectId, ref: 'User' }],
-  folder: { type: String, default: '' }, // Added folder field
+  folder: { type: String, default: null }, // Changed to store folder id (null for no folder)
 });
-
 const Note = mongoose.models.Note || mongoose.model('Note', NotesSchema);
-
-const FolderSchema = new Schema({
-  uid: { type: String, default: () => nanoid(), unique: true },
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  name: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now },
-});
-const Folder = mongoose.models.Folder || mongoose.model('Folder', FolderSchema);
 
 const LogSchema = new Schema({
   action: { type: String, required: true },
@@ -268,7 +269,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Added to handle large base64 payloads
 
 // Ensure all responses are JSON
 app.use((req, res, next) => {
@@ -297,46 +298,63 @@ io.on('connection', (socket) => {
 
 // AUTHENTICATION ROUTES
 
-
-
-// FOLDER ROUTES
 const folderRouter = express.Router();
 
+// FOLDER ROUTES
 folderRouter.get('/', fetchUser, async (req, res) => {
   try {
-    const folders = await Folder.find({ user: req.user.id }).select('name');
+    const folders = await Folder.find({ user: req.user.id }).select('id name parentFolder');
     res.json(folders);
   } catch (error) {
-    console.error(error.message);
+    console.error('Error fetching folders:', error.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
+// Create a folder
 folderRouter.post(
   '/',
   fetchUser,
-  [body('name', 'Folder name must be at least 3 characters').isLength({ min: 3 })],
+  [
+    body('name', 'Folder name must be at least 3 characters').isLength({ min: 3 }),
+    body('parentFolder').optional().isString(),
+  ],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const { name } = req.body;
+    const { name, parentFolder } = req.body;
     try {
-      const existingFolder = await Folder.findOne({ name, user: req.user.id });
+      // Check for duplicate folder name at the same level
+      const existingFolder = await Folder.findOne({
+        name,
+        user: req.user.id,
+        parentFolder: parentFolder || null,
+      });
       if (existingFolder) {
-        return res.status(400).json({ error: 'Folder with this name already exists' });
+        return res.status(400).json({ error: 'Folder with this name already exists at this level' });
+      }
+
+      // Validate parentFolder if provided
+      if (parentFolder) {
+        const parent = await Folder.findOne({ id: parentFolder, user: req.user.id });
+        if (!parent) {
+          return res.status(404).json({ error: 'Parent folder not found' });
+        }
       }
 
       const folder = new Folder({
+        id: nanoid(),
         name,
         user: req.user.id,
+        parentFolder: parentFolder || null,
       });
       const savedFolder = await folder.save();
 
       await Log.create({
         action: 'Folder Created',
         user: req.user.id,
-        details: `Folder ${savedFolder.uid} created by user ${req.user.id}`,
+        details: `Folder ${savedFolder.id} created by user ${req.user.id}`,
       });
 
       io.emit('folderAdded', savedFolder);
@@ -351,7 +369,226 @@ folderRouter.post(
   }
 );
 
+// Delete a folder and its contents
+folderRouter.delete('/:folderId', fetchUser, async (req, res) => {
+  try {
+    const folder = await Folder.findOne({ id: req.params.folderId, user: req.user.id });
+    if (!folder) return res.status(404).json({ error: 'Folder not found' });
+
+    // Recursively delete subfolders and clear folder assignments for notes
+    const deleteFolderAndContents = async (folderId) => {
+      // Find subfolders
+      const subfolders = await Folder.find({ parentFolder: folderId, user: req.user.id });
+      // Recursively delete each subfolder
+      for (const subfolder of subfolders) {
+        await deleteFolderAndContents(subfolder.id);
+      }
+      // Clear folder assignment for notes in this folder
+      await Note.updateMany(
+        { folder: folderId, user: req.user.id },
+        { $set: { folder: null } }
+      );
+      // Delete the folder
+      await Folder.deleteOne({ id: folderId, user: req.user.id });
+    };
+
+    await deleteFolderAndContents(folder.id);
+
+    await Log.create({
+      action: 'Folder Deleted',
+      user: req.user.id,
+      details: `Folder ${folder.id} and its contents deleted by user ${req.user.id}`,
+    });
+
+    io.emit('folderDeleted', { folderId: folder.id });
+    res.json({ success: true, message: 'Folder and its contents deleted' });
+  } catch (error) {
+    console.error('Error deleting folder:', error.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Update a folder's name
+folderRouter.put(
+  '/:folderId',
+  fetchUser,
+  [body('name', 'Folder name must be at least 3 characters').isLength({ min: 3 })],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const { name } = req.body;
+    try {
+      const folder = await Folder.findOne({ id: req.params.folderId, user: req.user.id });
+      if (!folder) return res.status(404).json({ error: 'Folder not found' });
+
+      // Check for duplicate name at the same level
+      const existingFolder = await Folder.findOne({
+        name,
+        user: req.user.id,
+        parentFolder: folder.parentFolder,
+        id: { $ne: folder.id },
+      });
+      if (existingFolder) {
+        return res.status(400).json({ error: 'Folder with this name already exists at this level' });
+      }
+
+      folder.name = name;
+      const updatedFolder = await folder.save();
+
+      await Log.create({
+        action: 'Folder Updated',
+        user: req.user.id,
+        details: `Folder ${folder.id} renamed to ${name} by user ${req.user.id}`,
+      });
+
+      io.emit('folderUpdated', updatedFolder);
+      res.json(updatedFolder);
+    } catch (error) {
+      console.error('Error updating folder:', error.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+
+// Move a folder to another folder
+folderRouter.post(
+  '/move',
+  fetchUser,
+  [
+    body('folderId', 'Folder ID is required').notEmpty(),
+    body('parentFolderId').optional().isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const { folderId, parentFolderId } = req.body;
+    try {
+      const folder = await Folder.findOne({ id: folderId, user: req.user.id });
+      if (!folder) return res.status(404).json({ error: 'Folder not found' });
+
+      // Prevent moving a folder to itself
+      if (folderId === parentFolderId) {
+        return res.status(400).json({ error: 'Cannot move a folder to itself' });
+      }
+
+      // Validate parentFolderId if provided
+      if (parentFolderId) {
+        const parent = await Folder.findOne({ id: parentFolderId, user: req.user.id });
+        if (!parent) return res.status(404).json({ error: 'Parent folder not found' });
+
+        // Check for cycles (prevent moving a folder to its descendant)
+        const isDescendant = async (currentId, targetId) => {
+          if (currentId === targetId) return true;
+          const currentFolder = await Folder.findOne({ id: currentId, user: req.user.id });
+          if (!currentFolder || !currentFolder.parentFolder) return false;
+          return isDescendant(currentFolder.parentFolder, targetId);
+        };
+        if (await isDescendant(parentFolderId, folderId)) {
+          return res.status(400).json({ error: 'Cannot move a folder to its descendant' });
+        }
+      }
+
+      // Check for duplicate name at the new parent level
+      const existingFolder = await Folder.findOne({
+        name: folder.name,
+        user: req.user.id,
+        parentFolder: parentFolderId || null,
+        id: { $ne: folder.id },
+      });
+      if (existingFolder) {
+        return res.status(400).json({ error: 'Folder with this name already exists at the target level' });
+      }
+
+      folder.parentFolder = parentFolderId || null;
+      const updatedFolder = await folder.save();
+
+      await Log.create({
+        action: 'Folder Moved',
+        user: req.user.id,
+        details: `Folder ${folder.id} moved to parent ${parentFolderId || 'root'} by user ${req.user.id}`,
+      });
+
+      io.emit('folderMoved', updatedFolder);
+      res.json(updatedFolder);
+    } catch (error) {
+      console.error('Error moving folder:', error.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+
 const authRouter = express.Router();
+
+authRouter.post(
+  '/update-profile-picture',
+  fetchUser,
+  [
+    body('profilePicture', 'Profile picture must be a valid base64 string').isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { profilePicture } = req.body;
+
+      // Validate base64 format
+      const base64Regex = /^data:image\/(jpeg|png|gif);base64,[A-Za-z0-9+/=]+$/;
+      if (!base64Regex.test(profilePicture)) {
+        return res.status(400).json({ error: 'Invalid base64 image format.' });
+      }
+
+      // Estimate size (base64 is ~1.33x larger than binary)
+      const base64Length = profilePicture.length;
+      const estimatedSize = (base64Length * 3) / 4 - (profilePicture.endsWith('==') ? 2 : profilePicture.endsWith('=') ? 1 : 0);
+      if (estimatedSize > 5 * 1024 * 1024) { // 5MB limit
+        return res.status(400).json({ error: 'Image size exceeds 5MB limit.' });
+      }
+
+      const user = await User.findById(req.user.id);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+
+      user.profilePicture = profilePicture;
+      await user.save();
+
+      await Log.create({
+        action: 'Profile Picture Updated',
+        user: user.uid,
+        details: `User ${user.email} updated their profile picture`,
+      });
+
+      res.json({ success: true, message: 'Profile picture updated successfully' });
+    } catch (error) {
+      console.error(error.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+
+authRouter.post('/delete-profile-picture', fetchUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!user.profilePicture) return res.status(400).json({ error: 'No profile picture to delete' });
+
+    user.profilePicture = null;
+    await user.save();
+
+    await Log.create({
+      action: 'Profile Picture Deleted',
+      user: user.uid,
+      details: `User ${user.email} deleted their profile picture`,
+    });
+
+    res.json({ success: true, message: 'Profile picture deleted successfully' });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
 
 authRouter.post(
   '/signup-with-otp',
@@ -1006,16 +1243,19 @@ notesRouter.post(
   fetchUser,
   [
     body('noteIds', 'Note IDs must be an array').isArray({ min: 1 }),
-    body('folder', 'Folder name is required').notEmpty(),
+    body('folderId', 'Folder ID is required').notEmpty(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const { noteIds, folder } = req.body;
+    const { noteIds, folderId } = req.body;
     try {
-      const folderExists = await Folder.findOne({ name: folder, user: req.user.id });
-      if (!folderExists) return res.status(404).json({ error: 'Folder not found' });
+      // Validate folderId (allow null for moving to "no folder")
+      if (folderId !== null) {
+        const folder = await Folder.findOne({ id: folderId, user: req.user.id });
+        if (!folder) return res.status(404).json({ error: 'Folder not found' });
+      }
 
       const notes = await Note.find({ uid: { $in: noteIds }, user: req.user.id });
       if (notes.length !== noteIds.length) {
@@ -1024,24 +1264,23 @@ notesRouter.post(
 
       await Note.updateMany(
         { uid: { $in: noteIds }, user: req.user.id },
-        { $set: { folder } }
+        { $set: { folder: folderId } }
       );
 
       await Log.create({
         action: 'Notes Bulk Moved',
         user: req.user.id,
-        details: `Notes ${noteIds.join(', ')} moved to folder ${folder} by user ${req.user.id}`,
+        details: `Notes ${noteIds.join(', ')} moved to folder ${folderId || 'none'} by user ${req.user.id}`,
       });
 
-      io.emit('notesBulkMoved', { noteIds, folder });
+      io.emit('notesBulkMoved', { noteIds, folderId });
       res.json({ success: true, message: 'Notes moved to folder' });
     } catch (error) {
-      console.error(error.message);
+      console.error('Error moving notes:', error.message);
       res.status(500).json({ error: 'Internal Server Error' });
     }
   }
 );
-
 notesRouter.delete('/:noteUid/comment/:commentId', fetchUser, async (req, res) => {
   try {
     const note = await Note.findOne({ uid: req.params.noteUid, isPublic: true });
@@ -1837,3 +2076,5 @@ app.use('/api/folders', folderRouter);
 server.listen(port, () => {
   console.log(`ApniNoteBook Backend listening on port ${port}`);
 });
+
+
