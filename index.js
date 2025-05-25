@@ -15,6 +15,8 @@ const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid'); // Add uuid for unique message IDs
+
 
 // Configuration Constants
 const JWT_SECRET = process.env.JWT_SECRET || 'Tanishisagoodb$oy';
@@ -131,6 +133,25 @@ const PaymentSchema = new Schema({
   status: { type: String, enum: ['success', 'failed', 'pending'], default: 'pending' },
 });
 const Payment = mongoose.models.Payment || mongoose.model('Payment', PaymentSchema);
+
+
+// New SCHEMAS & MODELS (add to existing schemas)
+const FriendshipSchema = new Schema({
+  sender: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  recipient: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  status: { type: String, enum: ['pending', 'accepted', 'declined'], default: 'pending' },
+  createdAt: { type: Date, default: Date.now },
+});
+const Friendship = mongoose.models.Friendship || mongoose.model('Friendship', FriendshipSchema);
+
+const MessageSchema = new Schema({
+  sender: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  recipient: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  content: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now },
+  messageId: { type: String, required: true, unique: true, default: uuidv4 }, // Unique message ID
+});
+const Message = mongoose.models.Message || mongoose.model('Message', MessageSchema);
 
 // Temporary storage for OTPs
 const otpStore = new Map();
@@ -283,15 +304,43 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error('Authentication error'));
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.user = decoded.user;
+    next();
+  } catch (error) {
+    next(new Error('Authentication error'));
+  }
+});
+
 // SOCKET.IO INTEGRATION
 io.on('connection', (socket) => {
   console.log('New client connected', socket.id);
-  socket.on('noteUpdated', (data) => {
-    io.emit('noteUpdated', data);
+  socket.on('sendMessage', async (message) => {
+    try {
+      const newMessage = new Message({
+        sender: socket.user.id,
+        recipient: message.recipientId,
+        content: message.content,
+        messageId: uuidv4(), // Generate unique message ID
+      });
+      await newMessage.save();
+      const populatedMessage = await Message.findById(newMessage._id)
+        .populate('sender', 'name profilePicture')
+        .populate('recipient', 'name profilePicture');
+      // Emit only to recipient, not sender
+      io.to(message.recipientId).emit('newMessage', populatedMessage);
+    } catch (error) {
+      console.error('Error saving message:', error);
+    }
   });
   socket.on('disconnect', () => {
     console.log('Client disconnected', socket.id);
   });
+  socket.join(socket.user.id); // Join a room with user ID
 });
 
 // ROUTES
@@ -1042,19 +1091,240 @@ authRouter.delete('/delete-account', fetchUser, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
-
     await Note.deleteMany({ user: req.user.id });
+    await Friendship.deleteMany({ $or: [{ sender: req.user.id }, { recipient: req.user.id }] });
+    await Message.deleteMany({ $or: [{ sender: req.user.id }, { recipient: req.user.id }] });
     await User.findByIdAndDelete(req.user.id);
-
     await Log.create({
       action: 'Account Deleted',
       user: user.uid,
       details: `User ${user.email} deleted their account`,
     });
-
     res.json({ success: true, message: 'Account deleted successfully' });
   } catch (error) {
     console.error(error.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Friend Routes
+const friendsRouter = express.Router();
+
+friendsRouter.get('/list', fetchUser, async (req, res) => {
+  try {
+    const friendships = await Friendship.find({
+      $or: [{ sender: req.user.id }, { recipient: req.user.id }],
+      status: 'accepted',
+    })
+      .populate('sender', 'name uid profilePicture')
+      .populate('recipient', 'name uid profilePicture');
+    const friends = friendships.map((f) =>
+      f.sender._id.toString() === req.user.id ? f.recipient : f.sender
+    );
+    const pendingRequests = await Friendship.find({
+      recipient: req.user.id,
+      status: 'pending',
+    }).populate('sender', 'name uid profilePicture');
+    res.json({ friends, pendingRequests });
+  } catch (error) {
+    console.error('Error fetching friends:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+friendsRouter.post('/search', fetchUser, [
+  body('query', 'Query must be at least 3 characters').isLength({ min: 3 }),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { query } = req.body;
+  try {
+    const users = await User.find({
+      $or: [
+        { name: { $regex: query, $options: 'i' } },
+        { uid: query },
+      ],
+      _id: { $ne: req.user.id },
+    }).select('name uid profilePicture');
+    res.json(users);
+  } catch (error) {
+    console.error('Error searching users:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+friendsRouter.post('/request', fetchUser, [
+  body('recipientId', 'Recipient ID is required').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { recipientId } = req.body;
+  try {
+    const recipient = await User.findById(recipientId);
+    if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
+    if (recipientId === req.user.id) return res.status(400).json({ error: 'Cannot send friend request to yourself' });
+
+    const existingFriendship = await Friendship.findOne({
+      $or: [
+        { sender: req.user.id, recipient: recipientId },
+        { sender: recipientId, recipient: req.user.id },
+      ],
+    });
+    if (existingFriendship) {
+      return res.status(400).json({ error: 'Friendship or request already exists' });
+    }
+
+    const friendship = new Friendship({
+      sender: req.user.id,
+      recipient: recipientId,
+    });
+    await friendship.save();
+
+    await Log.create({
+      action: 'Friend Request Sent',
+      user: req.user.id,
+      details: `User ${req.user.id} sent friend request to ${recipientId}`,
+    });
+
+    res.json({ success: true, message: 'Friend request sent' });
+  } catch (error) {
+    console.error('Error sending friend request:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+friendsRouter.post('/accept', fetchUser, [
+  body('requestId', 'Request ID is required').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { requestId } = req.body;
+  try {
+    const friendship = await Friendship.findById(requestId);
+    if (!friendship) return res.status(404).json({ error: 'Friend request not found' });
+    if (friendship.recipient.toString() !== req.user.id) {
+      return res.status(401).json({ error: 'Not authorized to accept this request' });
+    }
+    friendship.status = 'accepted';
+    await friendship.save();
+
+    const friend = await User.findById(friendship.sender).select('name uid profilePicture');
+
+    await Log.create({
+      action: 'Friend Request Accepted',
+      user: req.user.id,
+      details: `User ${req.user.id} accepted friend request from ${friendship.sender}`,
+    });
+
+    res.json({ success: true, friend });
+  } catch (error) {
+    console.error('Error accepting friend request:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+friendsRouter.post('/decline', fetchUser, [
+  body('requestId', 'Request ID is required').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { requestId } = req.body;
+  try {
+    const friendship = await Friendship.findById(requestId);
+    if (!friendship) return res.status(404).json({ error: 'Friend request not found' });
+    if (friendship.recipient.toString() !== req.user.id) {
+      return res.status(401).json({ error: 'Not authorized to decline this request' });
+    }
+    friendship.status = 'declined';
+    await friendship.save();
+
+    await Log.create({
+      action: 'Friend Request Declined',
+      user: req.user.id,
+      details: `User ${req.user.id} declined friend request from ${friendship.sender}`,
+    });
+
+    res.json({ success: true, message: 'Friend request declined' });
+  } catch (error) {
+    console.error('Error declining friend request:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+friendsRouter.get('/messages/:friendId', fetchUser, async (req, res) => {
+  try {
+    const messages = await Message.find({
+      $or: [
+        { sender: req.user.id, recipient: req.params.friendId },
+        { sender: req.params.friendId, recipient: req.user.id },
+      ],
+    })
+      .populate('sender', 'name profilePicture')
+      .populate('recipient', 'name profilePicture')
+      .sort({ timestamp: 1 });
+
+    // Convert ObjectIds to strings in the response
+    const formattedMessages = messages.map((msg) => ({
+      ...msg.toObject(),
+      sender: {
+        ...msg.sender.toObject(),
+        _id: msg.sender._id.toString(),
+      },
+      recipient: {
+        ...msg.recipient.toObject(),
+        _id: msg.recipient._id.toString(),
+      },
+    }));
+
+    res.json(formattedMessages);
+  } catch (error) {
+    console.error('Error fetching messages:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+friendsRouter.post('/send-message', fetchUser, [
+  body('recipientId', 'Recipient ID is required').notEmpty(),
+  body('content', 'Message content is required').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { recipientId, content } = req.body;
+  try {
+    const friendship = await Friendship.findOne({
+      $or: [
+        { sender: req.user.id, recipient: recipientId, status: 'accepted' },
+        { sender: recipientId, recipient: req.user.id, status: 'accepted' },
+      ],
+    });
+    if (!friendship) return res.status(400).json({ error: 'You are not friends with this user' });
+
+    const message = new Message({
+      sender: req.user.id,
+      recipient: recipientId,
+      content,
+      messageId: uuidv4(), // Generate unique message ID
+    });
+    await message.save();
+
+    const populatedMessage = await Message.findById(message._id)
+      .populate('sender', 'name profilePicture')
+      .populate('recipient', 'name profilePicture');
+
+    await Log.create({
+      action: 'Message Sent',
+      user: req.user.id,
+      details: `User ${req.user.id} sent message to ${recipientId}`,
+    });
+
+    res.json({ success: true, message: populatedMessage });
+  } catch (error) {
+    console.error('Error sending message:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -2071,6 +2341,7 @@ app.use('/api/analytics', analyticsRouter);
 app.use('/api/backup', backupRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/folders', folderRouter);
+app.use('/api/friends', friendsRouter);
 
 // START SERVER WITH SOCKET.IO
 server.listen(port, () => {
