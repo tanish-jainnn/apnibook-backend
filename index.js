@@ -156,6 +156,7 @@ const Message = mongoose.models.Message || mongoose.model('Message', MessageSche
 // Temporary storage for OTPs
 const otpStore = new Map();
 const resetStore = new Map();
+const onlineUsers = new Map(); // Track connections per user
 
 // Nodemailer transporter
 const transporter = nodemailer.createTransport({
@@ -318,29 +319,64 @@ io.use((socket, next) => {
 
 // SOCKET.IO INTEGRATION
 io.on('connection', (socket) => {
-  console.log('New client connected', socket.id);
+  const userId = socket.user.id;
+
+  // Handle user connection
+  if (!onlineUsers.has(userId)) {
+    onlineUsers.set(userId, 0);
+    // Emit online status to friends
+    Friendship.find({
+      $or: [{ sender: userId, status: 'accepted' }, { recipient: userId, status: 'accepted' }],
+    }).then((friendships) => {
+      const friends = friendships.map((f) =>
+        f.sender.toString() === userId ? f.recipient.toString() : f.sender.toString()
+      );
+      friends.forEach((friendId) => {
+        io.to(friendId).emit('userStatus', { userId, isOnline: true });
+      });
+    }).catch((error) => console.error('Error fetching friends on connect:', error));
+  }
+  onlineUsers.set(userId, onlineUsers.get(userId) + 1);
+
   socket.on('sendMessage', async (message) => {
     try {
       const newMessage = new Message({
         sender: socket.user.id,
         recipient: message.recipientId,
         content: message.content,
-        messageId: uuidv4(), // Generate unique message ID
+        messageId: uuidv4(),
       });
       await newMessage.save();
       const populatedMessage = await Message.findById(newMessage._id)
         .populate('sender', 'name profilePicture')
         .populate('recipient', 'name profilePicture');
-      // Emit only to recipient, not sender
       io.to(message.recipientId).emit('newMessage', populatedMessage);
     } catch (error) {
       console.error('Error saving message:', error);
     }
   });
+
   socket.on('disconnect', () => {
-    console.log('Client disconnected', socket.id);
+    const count = onlineUsers.get(userId) - 1;
+    if (count <= 0) {
+      onlineUsers.delete(userId);
+      // Emit offline status to friends
+      Friendship.find({
+        $or: [{ sender: userId, status: 'accepted' }, { recipient: userId, status: 'accepted' }],
+      }).then((friendships) => {
+        const friends = friendships.map((f) =>
+          f.sender.toString() === userId ? f.recipient.toString() : f.sender.toString()
+        );
+        friends.forEach((friendId) => {
+          io.to(friendId).emit('userStatus', { userId, isOnline: false });
+        });
+      }).catch((error) => console.error('Error fetching friends on disconnect:', error));
+    } else {
+      onlineUsers.set(userId, count);
+    }
   });
-  socket.join(socket.user.id); // Join a room with user ID
+
+  socket.join(socket.user.id); // User joins their own room
 });
 
 // ROUTES
