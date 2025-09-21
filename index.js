@@ -1381,7 +1381,7 @@ notesRouter.get('/fetchallnotes', fetchUser, async (req, res) => {
 notesRouter.get('/public', fetchUser, async (req, res) => {
   try {
     const publicNotes = await Note.find({ isPublic: true, isDeleted: false })
-      .populate('user', 'name')
+      .populate('user', 'name profilePicture') // Modified to include profilePicture
       .populate('comments.user', 'name');
     const notesWithLikeStatus = publicNotes.map(note => ({
       ...note.toObject(),
@@ -1390,6 +1390,34 @@ notesRouter.get('/public', fetchUser, async (req, res) => {
     res.json(notesWithLikeStatus);
   } catch (error) {
     console.error(error.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+// Get analytics for a specific note
+notesRouter.get('/analytics/:uid', fetchUser, async (req, res) => {
+  try {
+    const note = await Note.findOne({ uid: req.params.uid, user: req.user.id, isPublic: true })
+      .populate('likedBy', 'name profilePicture') // Include profilePicture
+      .populate('comments.user', 'name profilePicture'); // Include profilePicture
+    if (!note) {
+      return res.status(404).json({ error: 'Note not found or not public' });
+    }
+
+    const analytics = {
+      likes: note.likes || 0,
+      comments: note.comments || [],
+      likedBy: note.likedBy || [],
+    };
+
+    await Log.create({
+      action: 'Note Analytics Viewed',
+      user: req.user.id,
+      details: `User ${req.user.id} viewed analytics for note ${note.uid}`,
+    });
+
+    res.json(analytics);
+  } catch (error) {
+    console.error('Error fetching note analytics:', error.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -1765,20 +1793,48 @@ const paymentRouter = express.Router();
 
 paymentRouter.post('/create-order', fetchUser, async (req, res) => {
   try {
+    // Validate user
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    if (user.isPremium) {
+      return res.status(400).json({ error: 'User is already premium' });
+    }
+
+    // Validate environment variables
+    if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+      console.error('Razorpay credentials missing');
+      return res.status(500).json({ error: 'Server configuration error: Razorpay credentials missing' });
+    }
+
     const options = {
       amount: 99900, // ₹999 in paise
       currency: 'INR',
-      receipt: `receipt_${Date.now()}`,
+      receipt: `receipt_${nanoid()}`,
       payment_capture: 1,
     };
+
     const order = await razorpay.orders.create(options);
+    if (!order || !order.id) {
+      console.error('Razorpay order creation failed: No order ID returned');
+      return res.status(500).json({ error: 'Failed to create Razorpay order' });
+    }
+
     res.json({
       orderId: order.id,
       razorpayKey: process.env.RAZORPAY_KEY_ID,
     });
   } catch (error) {
-    console.error('Error creating Razorpay order:', error);
-    res.status(500).json({ error: 'Failed to create order' });
+    console.error('Error creating Razorpay order:', {
+      message: error.message,
+      stack: error.stack,
+      details: error,
+    });
+    res.status(500).json({ 
+      error: 'Failed to create order', 
+      details: error.message || 'Unknown error occurred during order creation' 
+    });
   }
 });
 
