@@ -153,6 +153,26 @@ const MessageSchema = new Schema({
 });
 const Message = mongoose.models.Message || mongoose.model('Message', MessageSchema);
 
+
+const ChatSessionSchema = new Schema({
+  id: { type: String, default: () => nanoid(), unique: true },
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: { type: String, default: 'New Chat' },
+  fileName: { type: String, default: null },
+  fileKind: { type: String, default: null },
+  messages: [
+    {
+      role: { type: String, enum: ['user', 'assistant'], required: true },
+      content: { type: String, required: true },
+      timestamp: { type: Date, default: Date.now },
+    },
+  ],
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+const ChatSession =
+  mongoose.models.ChatSession || mongoose.model('ChatSession', ChatSessionSchema);
+
 // Temporary storage for OTPs
 const otpStore = new Map();
 const resetStore = new Map();
@@ -2330,6 +2350,159 @@ adminRouter.delete('/security/:role', adminAuthMiddleware, async (req, res) => {
   }
 });
 
+const chatSessionRouter = express.Router();
+
+chatSessionRouter.get('/', fetchUser, async (req, res) => {
+  try {
+    const sessions = await ChatSession.find({ user: req.user.id })
+      .select('id title fileName fileKind createdAt updatedAt')
+      .sort({ updatedAt: -1 });
+    res.json(sessions);
+  } catch (err) {
+    console.error('Error fetching chat sessions:', err.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+ 
+// POST /api/chat-sessions         → create a new session (called when first message is sent)
+chatSessionRouter.post(
+  '/',
+  fetchUser,
+  [
+    body('title').optional().isString(),
+    body('fileName').optional().isString(),
+    body('fileKind').optional().isString(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+ 
+    try {
+      const { title, fileName, fileKind } = req.body;
+      const session = new ChatSession({
+        id: nanoid(),
+        user: req.user.id,
+        title: title || 'New Chat',
+        fileName: fileName || null,
+        fileKind: fileKind || null,
+      });
+      await session.save();
+      res.json(session);
+    } catch (err) {
+      console.error('Error creating chat session:', err.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+ 
+// GET  /api/chat-sessions/:id     → fetch one session with all its messages
+chatSessionRouter.get('/:id', fetchUser, async (req, res) => {
+  try {
+    const session = await ChatSession.findOne({ id: req.params.id, user: req.user.id });
+    if (!session) return res.status(404).json({ error: 'Chat session not found' });
+    res.json(session);
+  } catch (err) {
+    console.error('Error fetching chat session:', err.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+ 
+// POST /api/chat-sessions/:id/messages  → append one or two messages (user + assistant)
+chatSessionRouter.post(
+  '/:id/messages',
+  fetchUser,
+  [
+    body('messages', 'messages must be a non-empty array').isArray({ min: 1 }),
+    body('messages.*.role').isIn(['user', 'assistant']),
+    body('messages.*.content').isString().notEmpty(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+ 
+    try {
+      const session = await ChatSession.findOne({ id: req.params.id, user: req.user.id });
+      if (!session) return res.status(404).json({ error: 'Chat session not found' });
+ 
+      const { messages, title } = req.body;
+ 
+      // Auto-title from first user message if still default
+      if (session.title === 'New Chat' || title) {
+        const firstUser = messages.find((m) => m.role === 'user');
+        if (firstUser) {
+          session.title = title || firstUser.content.slice(0, 60).trim();
+        }
+      }
+ 
+      messages.forEach((m) =>
+        session.messages.push({ role: m.role, content: m.content })
+      );
+      session.updatedAt = new Date();
+      await session.save();
+ 
+      res.json({ success: true, session });
+    } catch (err) {
+      console.error('Error appending messages:', err.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+ 
+// PUT  /api/chat-sessions/:id/title   → rename a session
+chatSessionRouter.put(
+  '/:id/title',
+  fetchUser,
+  [body('title', 'Title is required').isString().notEmpty()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+ 
+    try {
+      const session = await ChatSession.findOne({ id: req.params.id, user: req.user.id });
+      if (!session) return res.status(404).json({ error: 'Chat session not found' });
+ 
+      session.title = req.body.title;
+      session.updatedAt = new Date();
+      await session.save();
+      res.json({ success: true, session });
+    } catch (err) {
+      console.error('Error renaming session:', err.message);
+      res.status(500).json({ error: 'Internal Server Error' });
+    }
+  }
+);
+ 
+// DELETE /api/chat-sessions/:id   → delete a session
+chatSessionRouter.delete('/:id', fetchUser, async (req, res) => {
+  try {
+    const session = await ChatSession.findOneAndDelete({ id: req.params.id, user: req.user.id });
+    if (!session) return res.status(404).json({ error: 'Chat session not found' });
+ 
+    await Log.create({
+      action: 'Chat Session Deleted',
+      user: req.user.id,
+      details: `Chat session ${req.params.id} deleted`,
+    });
+ 
+    res.json({ success: true, message: 'Chat session deleted' });
+  } catch (err) {
+    console.error('Error deleting chat session:', err.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+ 
+// DELETE /api/chat-sessions        → clear ALL sessions for the user
+chatSessionRouter.delete('/', fetchUser, async (req, res) => {
+  try {
+    await ChatSession.deleteMany({ user: req.user.id });
+    res.json({ success: true, message: 'All chat sessions cleared' });
+  } catch (err) {
+    console.error('Error clearing sessions:', err.message);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+ 
+
 // CONTACT ROUTE
 app.post(
   '/send-email',
@@ -2434,6 +2607,7 @@ app.use('/api/backup', backupRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/folders', folderRouter);
 app.use('/api/friends', friendsRouter);
+app.use('/api/chat-sessions', chatSessionRouter);
 
 // START SERVER WITH SOCKET.IO
 server.listen(port, () => {
